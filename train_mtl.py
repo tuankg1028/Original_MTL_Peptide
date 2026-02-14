@@ -1,0 +1,570 @@
+"""
+MTL Training Script - PDeepPP Architecture
+Trains all 19 peptide tasks jointly with frozen ESM-2 backbone.
+
+This is the training script used for Original_MTL_19tasks_aggressive model.
+The "aggressive" variant uses more aggressive hyperparameters for better performance.
+
+Usage:
+    python train_mtl.py --batch_size 16 --lr 1e-4 --epochs 50 --dropout 0.3
+
+Aggressive Training Configuration:
+    - Learning rate: 1e-4 (standard)
+    - Batch size: 16
+    - Epochs: 50 (aggressive - more epochs)
+    - Dropout: 0.3
+    - TIM Loss: Enabled
+    - Label smoothing: 0.1
+    - Gradient clipping: 1.0
+    - Mixed precision: Enabled
+"""
+
+import os
+import sys
+import json
+import random
+import argparse
+from pathlib import Path
+from datetime import datetime
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, matthews_corrcoef
+from tqdm import tqdm
+
+# Import model components
+from mtl_peptide_classifier import (
+    MTLPeptideClassifier,
+    MultiTaskDataLoader,
+    PeptideDataset,
+    TIMLoss,
+    get_all_peptide_tasks
+)
+
+
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+
+class MTLConfig:
+    """Configuration for MTL training."""
+
+    def __init__(self):
+        # Data
+        # Data directory - relative path for portability
+        script_dir = Path(__file__).parent
+        self.data_dir = str(script_dir / "datasets")
+        self.max_length = 128
+        self.batch_size = 16
+
+        # Model
+        self.hidden_dim = 1280
+        self.esm_ratio = 0.9
+        self.num_transformer_layers = 4
+        self.dropout = 0.3
+
+        # Training
+        self.learning_rate = 1e-4
+        self.weight_decay = 1e-5
+        self.num_epochs = 50
+        self.warmup_epochs = 5
+        self.grad_clip = 1.0
+
+        # Loss
+        self.use_tim_loss = True
+        self.label_smoothing = 0.1
+
+        # System
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.mixed_precision = True
+        self.num_workers = 2
+
+        # Paths - use relative path for portability
+        self.output_dir = str(script_dir / "checkpoints")
+        self.log_interval = 50
+
+
+# ============================================================================
+# METRICS & EVALUATION
+# ============================================================================
+
+def compute_metrics(logits, labels, task_name):
+    """Compute classification metrics for a task."""
+    # Get predictions
+    probs = torch.softmax(logits, dim=-1)
+    preds = torch.argmax(probs, dim=-1).cpu().numpy()
+    labels_np = labels.cpu().numpy()
+
+    # Basic metrics
+    accuracy = accuracy_score(labels_np, preds)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels_np, preds, average='binary', zero_division=0
+    )
+
+    # AUC (if binary)
+    try:
+        if probs.shape[1] == 2:
+            auc = roc_auc_score(labels_np, probs[:, 1].cpu().numpy())
+        else:
+            auc = 0.0
+    except:
+        auc = 0.0
+
+    # MCC
+    try:
+        mcc = matthews_corrcoef(labels_np, preds)
+    except:
+        mcc = 0.0
+
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc,
+        'mcc': mcc
+    }
+
+
+@torch.no_grad()
+def evaluate_task(model, dataloader, task_name, device, config):
+    """Evaluate model on a specific task."""
+    model.eval()
+
+    all_logits = []
+    all_labels = []
+
+    for batch in dataloader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+
+        with autocast(enabled=config.mixed_precision):
+            logits = model(input_ids, attention_mask, task_name)
+
+        all_logits.append(logits.cpu())
+        all_labels.append(labels.cpu())
+
+    all_logits = torch.cat(all_logits)
+    all_labels = torch.cat(all_labels)
+
+    metrics = compute_metrics(all_logits, all_labels, task_name)
+    return metrics
+
+
+@torch.no_grad()
+def evaluate_all_tasks(model, val_datasets, device, config):
+    """Evaluate model on all validation tasks."""
+    model.eval()
+
+    task_metrics = {}
+
+    for task_name, dataset in val_datasets.items():
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=0
+        )
+
+        metrics = evaluate_task(model, dataloader, task_name, device, config)
+        task_metrics[task_name] = metrics
+
+    return task_metrics
+
+
+# ============================================================================
+# TRAINING LOOP
+# ============================================================================
+
+class MTLTrainer:
+    """Multi-Task Learning Trainer."""
+
+    def __init__(self, model, train_loader, val_datasets, config):
+        self.model = model.to(config.device)
+        self.train_loader = train_loader
+        self.val_datasets = val_datasets
+        self.config = config
+
+        # Optimizer
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
+        )
+
+        # Scheduler
+        self.total_steps = len(train_loader) * config.num_epochs
+        self.warmup_steps = len(train_loader) * config.warmup_epochs
+
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.total_steps - self.warmup_steps,
+            eta_min=config.learning_rate * 0.01
+        )
+
+        # Loss
+        self.criterion = nn.CrossEntropyLoss(
+            label_smoothing=config.label_smoothing
+        )
+
+        if config.use_tim_loss:
+            self.tim_loss = TIMLoss(len(train_loader.task_names))
+        else:
+            self.tim_loss = None
+
+        # Mixed precision
+        self.scaler = GradScaler() if config.mixed_precision else None
+
+        # Training state
+        self.current_epoch = 0
+        self.global_step = 0
+        self.best_avg_f1 = 0.0
+        self.history = {
+            'train_loss': [],
+            'val_metrics': [],
+            'learning_rate': []
+        }
+
+        # Task name to index mapping for TIM loss
+        self.task_to_idx = {name: i for i, name in enumerate(train_loader.task_names)}
+
+        print(f"\n* Trainer initialized:")
+        print(f"  - Device: {config.device}")
+        print(f"  - Total steps: {self.total_steps}")
+        print(f"  - Warmup steps: {self.warmup_steps}")
+        print(f"  - TIM Loss: {config.use_tim_loss}")
+
+    def train(self):
+        """Main training loop."""
+
+        print("\n" + "="*80)
+        print("MTL TRAINING STARTED")
+        print("="*80)
+
+        for epoch in range(self.config.num_epochs):
+            self.current_epoch = epoch
+
+            print(f"\n{'='*80}")
+            print(f"Epoch {epoch+1}/{self.config.num_epochs}")
+            print(f"{'='*80}")
+
+            # Training
+            epoch_loss = self.train_epoch()
+
+            # Validation
+            val_metrics = evaluate_all_tasks(
+                self.model,
+                self.val_datasets,
+                self.config.device,
+                self.config
+            )
+
+            # Log metrics
+            self.log_metrics(epoch_loss, val_metrics)
+
+            # Save checkpoint
+            self.save_checkpoint(val_metrics)
+
+        print("\n" + "="*80)
+        print("TRAINING COMPLETED")
+        print("="*80)
+
+        # Save final results
+        self.save_final_results()
+
+        return self.history
+
+    def train_epoch(self):
+        """Train for one epoch."""
+        self.model.train()
+
+        total_loss = 0.0
+        losses = []
+        task_indices = []
+
+        pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader))
+
+        for step, (batch, task_name) in pbar:
+            input_ids = batch['input_ids'].to(self.config.device)
+            attention_mask = batch['attention_mask'].to(self.config.device)
+            labels = batch['label'].to(self.config.device)
+
+            # Forward
+            if self.scaler:
+                with autocast():
+                    logits = self.model(input_ids, attention_mask, task_name)
+                    loss = self.criterion(logits, labels)
+            else:
+                logits = self.model(input_ids, attention_mask, task_name)
+                loss = self.criterion(logits, labels)
+
+            # Backward
+            self.optimizer.zero_grad()
+
+            if self.scaler:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.grad_clip
+                )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.grad_clip
+                )
+                self.optimizer.step()
+
+            # Collect for TIM loss
+            losses.append(loss)
+            task_indices.append(self.task_to_idx[task_name])
+
+            # Scheduler after warmup
+            if self.global_step >= self.warmup_steps:
+                self.scheduler.step()
+
+            total_loss += loss.item()
+            self.global_step += 1
+
+            # Progress bar
+            pbar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'task': task_name
+            })
+
+        avg_loss = total_loss / len(self.train_loader)
+        return avg_loss
+
+    def log_metrics(self, train_loss, val_metrics):
+        """Log training and validation metrics."""
+
+        # Compute average metrics
+        avg_acc = np.mean([m['accuracy'] for m in val_metrics.values()])
+        avg_f1 = np.mean([m['f1'] for m in val_metrics.values()])
+        avg_auc = np.mean([m['auc'] for m in val_metrics.values()])
+
+        # Save history
+        self.history['train_loss'].append(train_loss)
+        self.history['val_metrics'].append(val_metrics)
+        self.history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
+
+        # Print summary
+        print(f"\nTrain Loss: {train_loss:.4f}")
+        print(f"Val Avg - ACC: {avg_acc:.4f} | F1: {avg_f1:.4f} | AUC: {avg_auc:.4f}")
+        print("\nPer-Task Metrics:")
+        for task_name, metrics in val_metrics.items():
+            print(f"  {task_name:25s}: ACC={metrics['accuracy']:.4f} F1={metrics['f1']:.4f} AUC={metrics['auc']:.4f}")
+
+    def save_checkpoint(self, val_metrics):
+        """Save model checkpoint."""
+
+        # Compute average F1
+        avg_f1 = np.mean([m['f1'] for m in val_metrics.values()])
+
+        # Save best model
+        if avg_f1 > self.best_avg_f1:
+            self.best_avg_f1 = avg_f1
+
+            checkpoint_dir = Path(self.config.output_dir) / "best_model"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+            # Save model
+            torch.save({
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'epoch': self.current_epoch,
+                'best_avg_f1': self.best_avg_f1,
+                'val_metrics': val_metrics
+            }, checkpoint_dir / "checkpoint.pt")
+
+            # Save heads only (for inference)
+            heads_state = {name: head.state_dict() for name, head in self.model.heads.items()}
+            torch.save(heads_state, checkpoint_dir / "heads.pt")
+
+            # Save shared components
+            torch.save({
+                'base_embed': self.model.base_embed.state_dict(),
+                'transformer': self.model.transformer.state_dict(),
+                'cnn': self.model.cnn.state_dict(),
+                'layer_norm': self.model.layer_norm.state_dict()
+            }, checkpoint_dir / "shared_backbone.pt")
+
+            print(f"\n* Saved best model (Avg F1: {avg_f1:.4f})")
+
+    def save_final_results(self):
+        """Save final training results."""
+
+        output_dir = Path(self.config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save training history
+        with open(output_dir / "training_history.json", 'w') as f:
+            json.dump(self.history, f, indent=2, default=str)
+
+        # Save final metrics
+        final_metrics = self.history['val_metrics'][-1] if self.history['val_metrics'] else {}
+
+        # Create summary
+        summary = {
+            'best_avg_f1': float(self.best_avg_f1),
+            'final_epoch': self.current_epoch + 1,
+            'final_metrics': {
+                task: {k: float(v) for k, v in metrics.items()}
+                for task, metrics in final_metrics.items()
+            },
+            'config': {
+                'learning_rate': self.config.learning_rate,
+                'batch_size': self.config.batch_size,
+                'num_epochs': self.config.num_epochs,
+                'dropout': self.config.dropout,
+                'use_tim_loss': self.config.use_tim_loss
+            }
+        }
+
+        with open(output_dir / "results.json", 'w') as f:
+            json.dump(summary, f, indent=2)
+
+        print(f"\n* Results saved to {output_dir}")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    """Main training function."""
+
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="MTL Training for Peptide Classification")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
+    parser.add_argument("--no_tim", action="store_true", help="Disable TIM loss")
+    parser.add_argument("--device", type=str, default=None, help="Device to use")
+
+    args = parser.parse_args()
+
+    # Configuration
+    config = MTLConfig()
+
+    if args.batch_size:
+        config.batch_size = args.batch_size
+    if args.lr:
+        config.learning_rate = args.lr
+    if args.epochs:
+        config.num_epochs = args.epochs
+    if args.dropout:
+        config.dropout = args.dropout
+    if args.no_tim:
+        config.use_tim_loss = False
+    if args.device:
+        config.device = args.device
+
+    # Create output directory
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set random seeds
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
+
+    print("\n" + "="*80)
+    print("MTL PEPTIDE CLASSIFIER - TRAINING")
+    print("="*80)
+    print(f"\nConfiguration:")
+    print(f"  - Batch size: {config.batch_size}")
+    print(f"  - Learning rate: {config.learning_rate}")
+    print(f"  - Epochs: {config.num_epochs}")
+    print(f"  - Dropout: {config.dropout}")
+    print(f"  - TIM Loss: {config.use_tim_loss}")
+    print(f"  - Device: {config.device}")
+
+    # Get task configurations
+    print("\n" + "-"*80)
+    print("Loading datasets...")
+    print("-"*80)
+
+    task_configs = get_all_peptide_tasks(config.data_dir)
+    print(f"\n* Detected {len(task_configs)} peptide tasks:")
+    for name, cfg in task_configs.items():
+        print(f"  - {name}: {cfg['num_classes']} classes")
+
+    # Import tokenizer
+    from transformers import EsmTokenizer
+    tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
+
+    # Create datasets
+    train_datasets = {}
+    val_datasets = {}
+
+    for task_name, cfg in task_configs.items():
+        prefix = cfg['csv_prefix']
+        train_path = Path(config.data_dir) / f"{prefix}_train.csv"
+        val_path = Path(config.data_dir) / f"{prefix}_test.csv"
+
+        if train_path.exists():
+            train_datasets[task_name] = PeptideDataset(
+                str(train_path),
+                tokenizer,
+                config.max_length
+            )
+        if val_path.exists():
+            val_datasets[task_name] = PeptideDataset(
+                str(val_path),
+                tokenizer,
+                config.max_length
+            )
+
+    print(f"\n* Created datasets:")
+    print(f"  - Train tasks: {len(train_datasets)}")
+    print(f"  - Val tasks: {len(val_datasets)}")
+
+    # Create model
+    print("\n" + "-"*80)
+    print("Creating model...")
+    print("-"*80)
+
+    model = MTLPeptideClassifier(
+        task_configs=task_configs,
+        hidden_dim=config.hidden_dim,
+        esm_ratio=config.esm_ratio,
+        num_transformer_layers=config.num_transformer_layers,
+        dropout=config.dropout
+    )
+
+    trainable = model.get_trainable_params()
+    total = sum(p.numel() for p in model.parameters())
+    print(f"\n* Model parameters:")
+    print(f"  - Total: {total:,}")
+    print(f"  - Trainable: {trainable:,} ({100*trainable/total:.2f}%)")
+
+    # Create dataloader
+    train_loader = MultiTaskDataLoader(train_datasets, config.batch_size)
+    print(f"\n* Created dataloader:")
+    print(f"  - Approx batches/epoch: {len(train_loader)}")
+
+    # Create trainer
+    trainer = MTLTrainer(model, train_loader, val_datasets, config)
+
+    # Train
+    history = trainer.train()
+
+    print("\n" + "="*80)
+    print("MTL TRAINING COMPLETED SUCCESSFULLY!")
+    print("="*80)
+    print(f"\nBest Avg F1: {trainer.best_avg_f1:.4f}")
+    print(f"Results saved to: {config.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
