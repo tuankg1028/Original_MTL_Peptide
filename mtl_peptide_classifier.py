@@ -29,9 +29,14 @@ class MTLPeptideClassifier(nn.Module):
     - Frozen ESM-2 (650M params) as base encoder
     - Learnable base embedding for amino acids
     - Weighted combination of ESM-2 and base embeddings
-    - Shared transformer encoder for global context
-    - Shared CNN for local features
+    - Shared transformer encoder for global context  [ablatable]
+    - Shared CNN for local features                  [ablatable]
     - Task-specific classification heads
+
+    Ablation flags:
+        use_transformer: include shared transformer encoder (default True)
+        use_cnn:         include shared CNN branch (default True)
+        unfreeze_esm:    allow ESM-2 gradients to flow (default False)
     """
 
     def __init__(
@@ -40,7 +45,10 @@ class MTLPeptideClassifier(nn.Module):
         hidden_dim: int = 1280,
         esm_ratio: float = 0.9,
         num_transformer_layers: int = 4,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        use_transformer: bool = True,
+        use_cnn: bool = True,
+        unfreeze_esm: bool = False,
     ):
         """
         Args:
@@ -49,62 +57,92 @@ class MTLPeptideClassifier(nn.Module):
             esm_ratio: Weight for ESM-2 vs base embedding (0-1)
             num_transformer_layers: Layers in shared transformer
             dropout: Dropout rate
+            use_transformer: Enable shared transformer encoder
+            use_cnn: Enable shared CNN branch
+            unfreeze_esm: Unfreeze ESM-2 backbone for fine-tuning
         """
         super().__init__()
 
-        # 1. Shared Encoder - Frozen ESM-2
+        self.use_transformer = use_transformer
+        self.use_cnn = use_cnn
+        self.unfreeze_esm = unfreeze_esm
+
+        # 1. Shared Encoder - ESM-2
         self.esm = EsmModel.from_pretrained("facebook/esm2_t33_650M_UR50D")
-        self.esm.requires_grad_(False)  # Freeze ESM-2 completely
+        if unfreeze_esm:
+            self.esm.requires_grad_(True)   # Fine-tune backbone
+        else:
+            self.esm.requires_grad_(False)  # Freeze ESM-2 completely
 
         # 2. Learnable Base Embedding (amino acid embeddings)
         self.base_embed = nn.Embedding(33, hidden_dim)  # 33 amino acids
         self.esm_ratio = esm_ratio
 
-        # 3. Shared Feature Extractor
-        # Transformer for global context
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=hidden_dim,
-                nhead=8,
-                dim_feedforward=hidden_dim * 4,
-                dropout=dropout,
-                batch_first=True
-            ),
-            num_layers=num_transformer_layers
-        )
+        # 3. Shared Feature Extractor (conditional on ablation flags)
+        if use_transformer:
+            self.transformer = nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=hidden_dim,
+                    nhead=8,
+                    dim_feedforward=hidden_dim * 4,
+                    dropout=dropout,
+                    batch_first=True
+                ),
+                num_layers=num_transformer_layers
+            )
 
-        # CNN for local features
-        self.cnn = nn.Conv1d(
-            hidden_dim,
-            hidden_dim,
-            kernel_size=7,
-            padding=3
-        )
-        self.layer_norm = nn.LayerNorm(hidden_dim)
+        if use_cnn:
+            self.cnn = nn.Conv1d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=7,
+                padding=3
+            )
+            self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        # Head input dimension depends on active branches
+        if use_transformer and use_cnn:
+            self.feature_dim = hidden_dim * 2   # concat global + local
+        else:
+            self.feature_dim = hidden_dim        # single branch or pass-through
 
         # 4. Task-Specific Heads (all sequence-level for peptides)
         self.heads = nn.ModuleDict()
         for name, cfg in task_configs.items():
             self.heads[name] = SequenceHead(
-                input_dim=hidden_dim * 2,
+                input_dim=self.feature_dim,
                 num_classes=cfg['num_classes'],
                 dropout=dropout
             )
 
+        esm_status = "Unfrozen" if unfreeze_esm else "Frozen"
+        branches = []
+        if use_transformer:
+            branches.append(f"{num_transformer_layers}-layer Transformer")
+        if use_cnn:
+            branches.append("CNN")
+        if not branches:
+            branches.append("Pass-through (embedding only)")
         print(f"* MTL Model initialized with {len(task_configs)} tasks")
-        print(f"  - ESM-2: Frozen (650M params)")
+        print(f"  - ESM-2: {esm_status} (650M params), ratio={esm_ratio}")
         print(f"  - Base Embedding: {hidden_dim} dim")
-        print(f"  - Shared Backbone: {num_transformer_layers} Transformer + CNN")
+        print(f"  - Shared Backbone: {' + '.join(branches)}")
+        print(f"  - Feature dim: {self.feature_dim}")
         print(f"  - Task Heads: {len(task_configs)} sequence-level")
 
     def encode(self, input_ids, attention_mask):
         """
         Encode sequences through shared backbone.
-        Returns: [B, L, 2*hidden_dim]
+        Returns: [B, L, feature_dim]
+          - feature_dim = 2*hidden_dim  when both Transformer + CNN active
+          - feature_dim =   hidden_dim  when only one branch active
         """
-        # ESM-2 embeddings (frozen)
-        with torch.no_grad():
+        # ESM-2 embeddings (frozen or unfrozen depending on ablation flag)
+        if self.unfreeze_esm:
             esm_out = self.esm(input_ids, attention_mask).last_hidden_state
+        else:
+            with torch.no_grad():
+                esm_out = self.esm(input_ids, attention_mask).last_hidden_state
 
         # Base embeddings (learnable)
         base_out = self.base_embed(input_ids)
@@ -112,16 +150,23 @@ class MTLPeptideClassifier(nn.Module):
         # Weighted combination
         x = self.esm_ratio * esm_out + (1 - self.esm_ratio) * base_out
 
-        # Parallel feature extraction
-        # Transformer: global context
-        global_feat = self.transformer(x)
-
-        # CNN: local features
-        local_feat = self.cnn(x.transpose(1, 2)).transpose(1, 2)
-        local_feat = self.layer_norm(local_feat)
-
-        # Concatenate global + local
-        shared_repr = torch.cat([global_feat, local_feat], dim=-1)  # [B, L, 2*hidden]
+        # Feature extraction — conditional on ablation flags
+        if self.use_transformer and self.use_cnn:
+            # Full model: parallel Transformer + CNN, then concat
+            global_feat = self.transformer(x)
+            local_feat = self.cnn(x.transpose(1, 2)).transpose(1, 2)
+            local_feat = self.layer_norm(local_feat)
+            shared_repr = torch.cat([global_feat, local_feat], dim=-1)  # [B, L, 2*hidden]
+        elif self.use_transformer:
+            # Ablation: Transformer only (no CNN)
+            shared_repr = self.transformer(x)
+        elif self.use_cnn:
+            # Ablation: CNN only (no Transformer)
+            shared_repr = self.cnn(x.transpose(1, 2)).transpose(1, 2)
+            shared_repr = self.layer_norm(shared_repr)
+        else:
+            # Ablation: pass-through (ESM embedding only, no feature extractor)
+            shared_repr = x
 
         return shared_repr
 
@@ -239,12 +284,14 @@ class MultiTaskDataLoader:
             batch_size: batch size per task
         """
         self.task_loaders = {}
+        import platform
+        nw = 0 if platform.system() == "Windows" else 2
         for task_name, dataset in task_datasets.items():
             self.task_loaders[task_name] = DataLoader(
                 dataset,
                 batch_size=batch_size,
                 shuffle=True,
-                num_workers=2,
+                num_workers=nw,
                 pin_memory=True
             )
         self.task_names = list(task_datasets.keys())
@@ -331,7 +378,8 @@ def get_all_peptide_tasks(data_dir: str) -> Dict[str, Dict]:
         "15__Antifungal_AF": "Antifungal",
         "16__AV_Antiviral": "Antiviral",
         "17__Toxicity_2021_Dataset": "Toxicity",
-        "18__Anti_inflammatory_peptides": "Anti_inflammatory"
+        "18__Anti_inflammatory_peptides": "Anti_inflammatory",
+        "19__Signal_peptides": "Signal_peptide"
     }
 
     task_configs = {}
@@ -341,9 +389,11 @@ def get_all_peptide_tasks(data_dir: str) -> Dict[str, Dict]:
         if prefix in task_mappings:
             task_name = task_mappings[prefix]
 
-            # Quick check: read sample of rows to detect all classes
-            df = pd.read_csv(csv_file, nrows=100)
-            n_classes = df['label'].nunique() if 'label' in df.columns else 2
+            # Read full file to correctly detect classes (sampling can miss minority class)
+            df = pd.read_csv(csv_file)
+            label_col = 'label' if 'label' in df.columns else 'Label'
+            n_classes = df[label_col].nunique() if label_col in df.columns else 2
+            n_classes = max(n_classes, 2)  # enforce minimum 2 for binary classification
 
             task_configs[task_name] = {
                 'num_classes': n_classes,

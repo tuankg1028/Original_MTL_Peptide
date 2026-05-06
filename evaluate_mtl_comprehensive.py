@@ -31,7 +31,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 import numpy as np
 from sklearn.metrics import (
     accuracy_score,
@@ -213,7 +213,7 @@ def evaluate_task(model, dataloader, task_name, device):
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['label'].to(device)
 
-        with autocast():
+        with autocast('cuda', enabled=torch.cuda.is_available()):
             logits = model(input_ids, attention_mask, task_name)
 
         all_logits.append(logits.cpu())
