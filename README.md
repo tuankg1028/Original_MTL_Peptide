@@ -2,41 +2,6 @@
 
 Multi-Task Learning (MTL) peptide classifier trained on 19 UniDL4BioPep peptide activity datasets using the PDeepPP architecture with frozen ESM-2 backbone.
 
-## Model Performance
-
-| Metric | Score |
-|--------|-------|
-| Average Accuracy | **89.49%** |
-| Average AUC | **94.15%** |
-| Average PR-AUC | **92.85%** |
-| Average MCC | **78.88%** |
-
-This is the **best performing model** among all MTL variants tested.
-
-### Per-Dataset Performance
-
-| Dataset | ACC | AUC | PR_AUC | MCC | F1 |
-|---------|-----|-----|--------|-----|-----|
-| ACE_inhibitory | 87.31% | 91.82% | 89.53% | 74.65% | 87.50% |
-| AntiMRSA | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% |
-| Anti_parasitic | 77.17% | 92.72% | 87.94% | 59.68% | 81.08% |
-| Antibacterial | 95.49% | 96.70% | 93.69% | 91.10% | 95.60% |
-| Anticancer | 72.97% | 82.20% | 80.17% | 46.80% | 70.10% |
-| Anticancer_alt | 97.16% | 98.93% | 97.81% | 94.39% | 97.22% |
-| Antifungal | 94.88% | 99.28% | 99.24% | 90.02% | 95.07% |
-| Antimalarial | 98.02% | 98.00% | 99.85% | 82.12% | 98.95% |
-| Antimalarial_alt | 100.00% | 100.00% | 100.00% | 100.00% | 100.00% |
-| Antimicrobial | 98.07% | 98.56% | 99.04% | 95.28% | 98.65% |
-| Antiviral | 85.47% | 90.04% | 86.70% | 71.86% | 86.54% |
-| BBP | 84.21% | 93.35% | 92.68% | 72.11% | 86.36% |
-| Bitter | 90.62% | 97.36% | 97.40% | 81.89% | 90.00% |
-| DPPIV_inhibitory | 84.21% | 92.88% | 93.33% | 68.43% | 84.09% |
-| NeuroPred | 90.52% | 95.15% | 94.08% | 81.03% | 90.50% |
-| Quorum_sensing | 95.00% | 96.38% | 94.13% | 90.45% | 95.24% |
-| TTCA | 64.97% | 73.31% | 64.48% | 33.94% | 62.70% |
-| Toxicity | 94.31% | 97.47% | 96.91% | 88.66% | 94.60% |
-| Umami | 89.89% | 94.70% | 97.11% | 76.33% | 93.02% |
-
 ## Architecture
 
 ```
@@ -190,16 +155,6 @@ with torch.no_grad():
 3. **Parallel Feature Extraction**: Combines global context (transformer) and local features (CNN)
 4. **TIM Loss**: Threshold-Independent Multi-task loss for balanced training across tasks
 5. **Masked Pooling**: Handles variable-length sequences properly
-
-## Comparison with Other Models
-
-| Model | Avg ACC | Avg AUC | Avg MCC |
-|-------|---------|---------|---------|
-| Original_MTL_19tasks | 87.79% | 93.80% | 74.43% |
-| Original_MTL_19tasks_finetuned | 88.21% | 93.64% | 75.19% |
-| Safe_MTL_19tasks | 88.20% | 93.36% | 74.89% |
-| **Original_MTL_19tasks_aggressive** | **89.49%** | **94.15%** | **78.88%** |
-| GradNorm_MTL | 87.45% | 92.94% | 73.66% |
 
 ## Requirements
 
