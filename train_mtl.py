@@ -30,7 +30,7 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torch.amp import autocast, GradScaler
 import numpy as np
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, matthews_corrcoef
@@ -88,6 +88,9 @@ class MTLConfig:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.mixed_precision = True
         self.num_workers = 2
+
+        # Validation split (fraction of training data used for checkpoint selection)
+        self.val_split = 0.2
 
         # Paths - use relative path for portability
         self.output_dir = str(script_dir / "checkpoints")
@@ -537,6 +540,8 @@ Ablation Study Examples:
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--dropout", type=float, default=0.3, help="Dropout rate")
     parser.add_argument("--device", type=str, default=None, help="Device to use")
+    parser.add_argument("--val_split", type=float, default=0.2,
+                        help="Fraction of train data held out for validation/checkpoint selection (default 0.1)")
 
     # Loss ablations
     parser.add_argument("--no_tim", action="store_true", help="Disable TIM loss")
@@ -571,6 +576,8 @@ Ablation Study Examples:
     config.dropout = args.dropout
     if args.device:
         config.device = args.device
+
+    config.val_split = args.val_split
 
     # Loss
     config.use_tim_loss = not args.no_tim
@@ -628,31 +635,36 @@ Ablation Study Examples:
     from transformers import EsmTokenizer
     tokenizer = EsmTokenizer.from_pretrained("facebook/esm2_t33_650M_UR50D")
 
-    # Create datasets
+    # Create datasets — 3-way split following UniDL4BioPep methodology:
+    #   train_datasets : 90% of *_train.csv  — model learns from this
+    #   val_datasets   : 10% of *_train.csv  — used only to select best checkpoint
+    #   test_datasets  : *_test.csv           — touched once after training for final reporting
     train_datasets = {}
     val_datasets = {}
+    test_datasets = {}
+
+    rng = torch.Generator().manual_seed(42)
 
     for task_name, cfg in task_configs.items():
         prefix = cfg['csv_prefix']
         train_path = Path(config.data_dir) / f"{prefix}_train.csv"
-        val_path = Path(config.data_dir) / f"{prefix}_test.csv"
+        test_path = Path(config.data_dir) / f"{prefix}_test.csv"
 
         if train_path.exists():
-            train_datasets[task_name] = PeptideDataset(
-                str(train_path),
-                tokenizer,
-                config.max_length
-            )
-        if val_path.exists():
-            val_datasets[task_name] = PeptideDataset(
-                str(val_path),
-                tokenizer,
-                config.max_length
-            )
+            full_train = PeptideDataset(str(train_path), tokenizer, config.max_length)
+            n_val = max(1, int(len(full_train) * config.val_split))
+            n_train = len(full_train) - n_val
+            train_subset, val_subset = random_split(full_train, [n_train, n_val], generator=rng)
+            train_datasets[task_name] = train_subset
+            val_datasets[task_name] = val_subset
+
+        if test_path.exists():
+            test_datasets[task_name] = PeptideDataset(str(test_path), tokenizer, config.max_length)
 
     print(f"\n* Created datasets:")
-    print(f"  - Train tasks: {len(train_datasets)}")
-    print(f"  - Val tasks: {len(val_datasets)}")
+    print(f"  - Train tasks:  {len(train_datasets)} ({1 - config.val_split:.0%} of train CSV)")
+    print(f"  - Val tasks:    {len(val_datasets)} ({config.val_split:.0%} of train CSV, for checkpoint selection)")
+    print(f"  - Test tasks:   {len(test_datasets)} (held-out, evaluated once after training)")
 
     # Create model
     print("\n" + "-"*80)
@@ -691,8 +703,48 @@ Ablation Study Examples:
     print("MTL TRAINING COMPLETED SUCCESSFULLY!")
     print("="*80)
     print(f"\nVariant:          {variant}")
-    print(f"Best Avg F1:      {trainer.best_avg_f1:.4f}")
+    print(f"Best Val Avg F1:  {trainer.best_avg_f1:.4f}  (on validation split — used for checkpoint selection)")
     print(f"Results saved to: {Path(config.output_dir) / variant}")
+
+    # ---- One-shot test evaluation on held-out test set ----
+    best_checkpoint_path = Path(config.output_dir) / variant / "best_model" / "checkpoint.pt"
+    if test_datasets and best_checkpoint_path.exists():
+        print("\n" + "-"*80)
+        print("Final evaluation on held-out test set (best checkpoint)")
+        print("-"*80)
+
+        checkpoint = torch.load(best_checkpoint_path, map_location=config.device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(config.device)
+
+        test_metrics = evaluate_all_tasks(model, test_datasets, config.device, config)
+
+        test_avg_acc = np.mean([m['accuracy'] for m in test_metrics.values()])
+        test_avg_f1  = np.mean([m['f1']       for m in test_metrics.values()])
+        test_avg_auc = np.mean([m['auc']       for m in test_metrics.values()])
+        test_avg_mcc = np.mean([m['mcc']       for m in test_metrics.values()])
+
+        print(f"\nTest Avg — ACC: {test_avg_acc:.4f} | F1: {test_avg_f1:.4f} | AUC: {test_avg_auc:.4f} | MCC: {test_avg_mcc:.4f}")
+        print("\nPer-Task Test Metrics:")
+        for task_name, m in test_metrics.items():
+            print(f"  {task_name:25s}: ACC={m['accuracy']:.4f} F1={m['f1']:.4f} AUC={m['auc']:.4f} MCC={m['mcc']:.4f}")
+
+        # Save test results alongside the checkpoint
+        test_results = {
+            'best_val_avg_f1': float(trainer.best_avg_f1),
+            'test_avg_acc':    float(test_avg_acc),
+            'test_avg_f1':     float(test_avg_f1),
+            'test_avg_auc':    float(test_avg_auc),
+            'test_avg_mcc':    float(test_avg_mcc),
+            'test_metrics': {
+                task: {k: float(v) for k, v in m.items()}
+                for task, m in test_metrics.items()
+            }
+        }
+        results_path = Path(config.output_dir) / variant / "test_results.json"
+        with open(results_path, 'w') as f:
+            json.dump(test_results, f, indent=2)
+        print(f"\n* Test results saved to {results_path}")
 
 
 if __name__ == "__main__":

@@ -68,5 +68,9 @@ logs/
 Thumbs.db
 *.bak
 
+# Local results notes (not for publishing)
+results_*.md
+eval_full_metrics.py
+
 # Empty file created
 nul
