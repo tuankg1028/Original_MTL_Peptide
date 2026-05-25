@@ -8,7 +8,7 @@ from huggingface_hub import HfApi, login
 from pathlib import Path
 
 # Configuration
-MODEL_NAME = "tuankg1028/MTL-Peptide-Classifier"
+MODEL_NAME = "minhquoc95/MTL-PepPred"
 CHECKPOINT_DIR = "checkpoints/best_model"
 REPO_ID = MODEL_NAME
 
@@ -77,7 +77,7 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 
 for file in ["checkpoint.pt", "heads.pt", "shared_backbone.pt"]:
     hf_hub_download(
-        repo_id="tuankg1028/MTL-Peptide-Classifier",
+        repo_id="minhquoc95/MTL-PepPred",
         filename=file,
         local_dir=checkpoint_dir
     )
